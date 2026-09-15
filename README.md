@@ -18,14 +18,160 @@ Read [`problem_statement.md`](./problem_statement.md) for the full task spec, in
 
 ---
 
+## My Solution
+
+Python, entry point `code/main.py`. Two layers:
+
+- **Deterministic core** (`ingest.py`, `streams.py`, `forecast.py`, `planner.py`, `format.py`,
+  `validate.py`) — no model calls. Reconstructs each user's recurring cash-flow streams from
+  `financial_events.csv`, projects a 90-day balance curve, generates every eligible payment
+  candidate (full / partial / each installment option / wait, change-assisted where needed),
+  ranks them per the spec's stated order, and writes `output.csv`.
+- **Evidence extraction** (`evidence.py`) — the only stage that calls a model: **Claude Sonnet 5**
+  (`claude-sonnet-5`), via the `anthropic` SDK, structured tool-call output only (never free
+  text a downstream step could "read" as an instruction — this is what keeps prompt-injection
+  attempts in the message data inert by construction). Fills blank event amounts from linked
+  images and applies income date/amount amendments from linked messages.
+
+The model's role is deliberately limited to extraction: it turns an unstructured receipt image
+or message body into a typed fact (`amount`, `currency`, `effective_date`, `fact_type`,
+`confidence`), never a decision. Every affordability call, ranking, and dollar figure is
+produced by deterministic code so the same inputs always reach the same conclusion, the whole
+decision path is auditable and testable, and an adversarial message has no output slot to
+inject a directive into — a live test against the dataset's two actual advance-fee-fraud
+messages confirms both are correctly extracted as "no fact," never as income or an expense.
+
+### Architecture — nine stages
+
+```text
+dataset/*.csv + media/images/*.png
+   │
+   ├─ 1. Ingest & normalize      currency conversion, cash-date resolution
+   ├─ 2. Evidence resolution     Claude Sonnet 5 → typed facts (images, messages)
+   ├─ 3. Canonical state         group events into per-user CashflowStreams,
+   │                             detect cadence (monthly / interval / one-off),
+   │                             collapse linked_event_id lifecycle chains
+   ├─ 4. 90-day forecast         project streams forward → balance curve, trough
+   ├─ 5. Candidate plans         full / partial / each installment option / wait /
+   │                             change-assisted full payment (re-forecast based)
+   ├─ 6. Safety validation       reject any candidate breaching minimum balance
+   ├─ 7. Eligibility filter      accepted payment methods, installment-month cap,
+   │                             partial-payment allowance
+   ├─ 8. Ranking                 deadline met → no spending changes → lowest cost →
+   │                             earlier start → fewer payments → lowest option id
+   └─ 9. Emit + validate         write output.csv, run the invariant sweep
+```
+
+Stages 1 and 3–9 are pure deterministic code. Stage 2 is the only place a model is called, and
+it caches during development only — the official run that produced the submitted `output.csv`
+makes every call live, with no cache.
+
+### Results (the actual submitted run)
+
+- **250/250 rows generated, 0 invariant violations** on the submitted `output.csv` (bounds,
+  plan-sum identities, installment-matches-option, flexible-only spending changes, the
+  status/method/plan consistency rule).
+- **209 live model calls** (198 message extractions, 11 image extractions), **282,011 total
+  tokens**, **$1.2347 total cost** (~$0.0049/request) — see
+  [`code/evaluation/usage_report.md`](./code/evaluation/usage_report.md) for the full breakdown.
+- Against the 25 publicly solved samples: **17/25** exact categorical match
+  (`affordability_status` / `recommended_payment_method` / `payment_plan` shape), **6/25** also
+  within 1% on `amount_safe_to_pay`. The dataset has no ground truth for the 250 evaluation
+  requests, so this is the only real accuracy signal available pre-submission — reported as-is
+  rather than rounded up.
+- `code/fragility_check.py` flags **10/250** requests whose forecasted capacity sits within 3%
+  of a decision boundary (`0` or `requested_amount`) — see Known Limitations.
+
+### Setup
+
+```bash
+pip install -r requirements.txt
+```
+
+Create a `.env` file in the repo root (gitignored, never committed) with:
+
+```
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+### Run
+
+```bash
+python3 code/main.py
+```
+
+Reads `dataset/requests.csv`, writes `output.csv` to the repo root, and regenerates
+`code/evaluation/usage_report.md` from that same run (`python3 code/final_run.py` is the
+identical entrypoint used for the actual submitted run, with the token/cost report wired in
+explicitly).
+
+Other scripts: `code/replay_samples.py` (checks the pipeline against the 25 solved samples in
+`dataset/sample_requests.csv`), `code/test_evidence.py` (isolated eval of `evidence.py` against
+known-correct extractions before it's wired into the forecast), `code/validate.py` (the
+invariant sweep, importable and also run automatically as part of `final_run.py`),
+`code/fragility_check.py` (flags predictions whose forecasted capacity sits close to a
+decision boundary — see Known Limitations).
+
+### Key modelling decisions
+
+A few places the spec doesn't fully determine the answer; documented rather than left implicit:
+
+- **`max_installment_months` is read as a duration** — an option is eligible only if
+  `ceil(number_of_payments × payment_frequency_days / 30) ≤ max_installment_months`, not a
+  plain `number_of_payments ≤ max_installment_months`. Affects 6 of 261 eligible-cap options in
+  the eval set; the samples don't discriminate between the two readings.
+- **Recurring streams are detected, not read** — no field states recurrence. A stream is
+  `monthly` when its historical occurrences share a day-of-month (±2 days) across ≥3
+  occurrences, or `interval` when the median gap between occurrences falls in [3, 35] days.
+- **Spending changes are evaluated by re-forecasting**, not by comparing a static per-occurrence
+  saving against a static gap — a change permanently reduces every future occurrence of a
+  stream within the horizon, and whether it closes the gap is answered by re-running the whole
+  90-day forecast with the change applied.
+- **Overlapping same-category expense descriptions are pooled** before interval-cadence
+  detection (e.g. 6-8 distinct "groceries" descriptions for one user), so the forecast computes
+  one rate for the category instead of summing many independent per-description projections.
+- **Income streams whose description drifts** (a raise, a relabelled payroll row, "Next
+  confirmed salary") are merged into one continuing stream when they share a day-of-month and
+  don't overlap in time — gated to users with ≤3 distinct income descriptions, since unrestricted
+  merging was checked directly and found to wrongly blend genuinely concurrent income (dual
+  earners, multiple gig-payout streams).
+
+### Known limitations (disclosed, not silently shipped)
+
+- **Gig/irregular-income cadence** is the largest remaining source of forecast error — income
+  patterns that are neither monthly nor a clean 3-35 day interval (several one-off or
+  quarterly-ish payments) are under-projected. Affects a specific, identifiable subset of users;
+  not fixed in this submission.
+- **Category pooling trades one bias for another.** It fixes over-summation for users with many
+  overlapping expense descriptions, but the correct degree of pooling varies by user in a way
+  no single global rule captures — verified directly (not assumed) on a case where pooling
+  under-drains despite identical description-count structure to cases it correctly fixes.
+- **`code/fragility_check.py`** flags 10 of 250 requests whose forecasted capacity sits within a
+  few percent of a decision boundary (`0` or `requested_amount`) — these are the rows most
+  likely to have their categorical output flipped by a small forecast-accuracy error, and are
+  worth a manual second look given the deadline allowed for it.
+- **Two invariants from the initial design (documented in the development transcript) turned
+  out to be over-fit to the 25 solved samples, not universal**: `amount_safe_to_pay` can
+  legitimately be `0` (the tightest-headroom user in the dataset genuinely breaches their
+  minimum balance from baseline spending alone), and `earliest_date_for_full_payment` can be
+  empty while the request is still `affordable_with_plan` (a change-assisted plan works today
+  even when no *unassisted* full payment is ever safe within 90 days). `code/validate.py`
+  reflects the corrected understanding, verified against the real 250-row eval set rather than
+  assumed from the smaller sample.
+
+---
+
 ## Quick Start
 
 Clone the repository and move into the project directory:
 
 ```bash
-git clone https://github.com/interviewstreet/hackerrank-orchestrate-september26.git
+git clone https://github.com/CAPP-Financials/hackerrank-orchestrate-september26.git
 cd hackerrank-orchestrate-september26
 ```
+
+(This is a fork/personal copy built for the HackerRank Orchestrate hackathon; the original
+starter repo is [interviewstreet/hackerrank-orchestrate-september26](https://github.com/interviewstreet/hackerrank-orchestrate-september26).)
 
 Build your solution in `code/main.py`, or use another language and document its entry point clearly.
 
