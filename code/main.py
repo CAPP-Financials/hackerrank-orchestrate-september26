@@ -13,8 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import ingest
 import streams as streams_mod
-import planner
-import format as fmt
+import rationale as rationale_mod
 import evidence
 
 OUTPUT_COLUMNS = [
@@ -57,19 +56,8 @@ def process_all(requests_path_name="requests.csv", use_evidence=True):
         req = dict(req)
         req["_options"] = options_by_request.get(req["request_id"], [])
 
-        result = planner.decide(st, profile, req)
-        explanation = fmt.explain(result, req, profile)
-
-        rows.append({
-            "request_id": req["request_id"],
-            "amount_safe_to_pay": result["amount_safe_to_pay"],
-            "affordability_status": result["affordability_status"],
-            "recommended_payment_method": result["recommended_payment_method"],
-            "payment_plan": result["payment_plan"],
-            "earliest_date_for_full_payment": result["earliest_date_for_full_payment"],
-            "spending_changes_needed": result["spending_changes_needed"],
-            "decision_explanation": explanation,
-        })
+        rat = rationale_mod.build_rationale(req, profile, st)
+        rows.append(rat.as_row())
     return rows
 
 
