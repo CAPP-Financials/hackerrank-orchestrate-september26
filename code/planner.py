@@ -210,9 +210,13 @@ def rank(candidates):
     return sorted(candidates, key=key)
 
 
-def decide(streams, profile, request):
-    """Full decision pipeline for one request. Returns the 8-field output
-    dict (request_id excluded -- caller adds it)."""
+def generate_candidates(streams, profile, request, safe_amt, earliest):
+    """Builds every eligible candidate plan (full / partial / each
+    installment option / wait) for one request. Pure function relative to
+    its caller: mutates `streams` only via `_resolve_sub_stream` attaching
+    `_sub_stream` onto change-candidate dicts (unchanged behavior from the
+    original `decide()`), never the streams' cash-flow data itself. Returns
+    the UNRANKED candidate list -- `rank()` orders it."""
     balance = profile["current_available_balance"]
     min_balance = profile["minimum_balance_to_keep"]
     request_date = datetime.date.fromisoformat(request["request_date"])
@@ -224,9 +228,6 @@ def decide(streams, profile, request):
     change_candidates = streams_mod.resolve_change_candidates(streams, profile)
     for c in change_candidates:
         _resolve_sub_stream(streams, c)
-
-    safe_amt = forecast.amount_safe_to_pay(streams, balance, min_balance, request_date, requested_amount)
-    earliest = forecast.earliest_date_for_full_payment(streams, balance, min_balance, request_date, requested_amount)
 
     candidates = []
     if "full_payment" in accepted_methods:
@@ -247,7 +248,23 @@ def decide(streams, profile, request):
         wt = generate_wait(request_date, requested_amount, earliest, desired_completion)
         if wt:
             candidates.append(wt)
+    return candidates
 
+
+def decide(streams, profile, request):
+    """Full decision pipeline for one request. Returns the 8-field output
+    dict (request_id excluded -- caller adds it) plus `_all_candidates`,
+    the full ranked list, for callers (rationale.py) that need to reason
+    about which candidates were considered, not just the winner."""
+    balance = profile["current_available_balance"]
+    min_balance = profile["minimum_balance_to_keep"]
+    request_date = datetime.date.fromisoformat(request["request_date"])
+    requested_amount = request["requested_amount"]
+
+    safe_amt = forecast.amount_safe_to_pay(streams, balance, min_balance, request_date, requested_amount)
+    earliest = forecast.earliest_date_for_full_payment(streams, balance, min_balance, request_date, requested_amount)
+
+    candidates = generate_candidates(streams, profile, request, safe_amt, earliest)
     ranked = rank(candidates)
     final = ranked[0] if ranked else None
 
@@ -277,6 +294,7 @@ def decide(streams, profile, request):
         "earliest_date_for_full_payment": earliest_str,
         "spending_changes_needed": changes_str,
         "_final": final,
+        "_all_candidates": ranked,
         "_safe_amt": safe_amt,
         "_earliest": earliest,
     }
