@@ -1,7 +1,8 @@
 """
 Stage 2: evidence extraction (images + messages) -- claude-sonnet-5 only,
-per the locked decision. No caching in production (also locked, explicitly
-accepted trade-off) -- every call here is live.
+per the locked decision. Every model call is content-addressed and cached
+via cache.py (see docs/FAILURES.md, first entry, for why the earlier
+no-caching-in-production decision was reversed).
 
 Guardrail: the model's role is extraction only, never decision-making.
 Every call forces a structured tool-call response (typed fields), never a
@@ -17,35 +18,13 @@ from pathlib import Path
 
 import anthropic
 
+import cache
 import usage_tracker
 
 MODEL = "claude-sonnet-5"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MEDIA_DIR = REPO_ROOT / "dataset" / "media" / "images"
 MAX_RETRIES = 3
-
-# Dev-only cache for iteration speed while debugging the wiring -- the
-# LOCKED decision is no caching in the final/production run. main.py's
-# __main__ entrypoint (the run that produces the submitted output.csv)
-# must set DEV_CACHE=None before the real run. Gitignored.
-DEV_CACHE_PATH = REPO_ROOT / ".devcache" / "evidence_cache.json"
-DEV_CACHE_ENABLED = False
-_dev_cache = None
-
-
-def _load_dev_cache():
-    global _dev_cache
-    if _dev_cache is None:
-        if DEV_CACHE_PATH.exists():
-            _dev_cache = json.loads(DEV_CACHE_PATH.read_text(encoding="utf-8"))
-        else:
-            _dev_cache = {}
-    return _dev_cache
-
-
-def _save_dev_cache():
-    DEV_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    DEV_CACHE_PATH.write_text(json.dumps(_dev_cache, indent=2), encoding="utf-8")
 
 
 def load_dotenv():
@@ -128,12 +107,14 @@ def _call_with_retry(build_kwargs):
 
 def extract_image_amount(image_id, context_hint=""):
     """Returns {'amount': float, 'confidence': str, 'basis': str} or None
-    (excluded, never zero) on failure/low-plausibility."""
-    cache_key = f"image:{image_id}:{context_hint}"
-    if DEV_CACHE_ENABLED:
-        cache = _load_dev_cache()
-        if cache_key in cache:
-            return cache[cache_key]
+    (excluded, never zero) on failure/low-plausibility. Cached -- see
+    cache.py's module docstring."""
+    payload = {"kind": "image_amount", "image_id": image_id, "context_hint": context_hint,
+               "tool_schema": IMAGE_TOOL}
+    cached = cache.get(payload, MODEL)
+    if cached is not cache.MISS:
+        return cached
+
     path = MEDIA_DIR / f"{image_id}.png"
     if not path.exists():
         return None
@@ -168,10 +149,7 @@ def extract_image_amount(image_id, context_hint=""):
             if amount is not None and amount >= 0:  # else stays None -- exclude, never zero
                 result = {"amount": float(amount), "confidence": block.input.get("confidence"),
                           "basis": block.input.get("basis")}
-    if DEV_CACHE_ENABLED:
-        cache = _load_dev_cache()
-        cache[cache_key] = result
-        _save_dev_cache()
+    cache.put(payload, MODEL, result)
     return result
 
 
@@ -282,12 +260,14 @@ def apply_income_amendments(events, user_id, messages_for_user, request_date_str
 
 
 def extract_message_fact(message_text, context_hint=""):
-    """Returns a dict matching MESSAGE_TOOL's schema, or None on failure."""
-    cache_key = f"msg:{hash(message_text)}:{context_hint}"
-    if DEV_CACHE_ENABLED:
-        cache = _load_dev_cache()
-        if cache_key in cache:
-            return cache[cache_key]
+    """Returns a dict matching MESSAGE_TOOL's schema, or None on failure.
+    Cached -- see cache.py's module docstring."""
+    payload = {"kind": "message_fact", "message_text": message_text, "context_hint": context_hint,
+               "tool_schema": MESSAGE_TOOL}
+    cached = cache.get(payload, MODEL)
+    if cached is not cache.MISS:
+        return cached
+
     resp = _call_with_retry({
         "model": MODEL,
         "max_tokens": 300,
@@ -312,8 +292,5 @@ def extract_message_fact(message_text, context_hint=""):
     for block in resp.content:
         if block.type == "tool_use" and block.name == "extract_fact":
             result = block.input
-    if DEV_CACHE_ENABLED:
-        cache = _load_dev_cache()
-        cache[cache_key] = result
-        _save_dev_cache()
+    cache.put(payload, MODEL, result)
     return result

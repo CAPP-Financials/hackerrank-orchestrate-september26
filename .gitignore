@@ -1,5 +1,6 @@
 log.txt
 .env
 .devcache/
+.cache/
 __pycache__/
 *.pyc
