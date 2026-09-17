@@ -23,7 +23,7 @@ def _prose_date(d):
     return f"{d.day} {d.strftime('%B')} {d.year}"
 
 
-def explain(result, request, profile, streams_by_desc=None):
+def render_explanation(result, request, profile, streams_by_desc=None):
     cur = profile["home_currency"]
     minb = profile["minimum_balance_to_keep"]
     req_amt = request["requested_amount"]
